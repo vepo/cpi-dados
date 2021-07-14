@@ -6,7 +6,7 @@
 
 	<groupId>br.com.povo</groupId>
 	<artifactId>cpi-dados</artifactId>
-	<version>0.0.1</version>
+	<version>0.0.2</version>
 	<packaging>jar</packaging>
 	<name>Dados CPI :: COVID</name>
 
