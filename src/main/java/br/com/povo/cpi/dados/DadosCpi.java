@@ -1,7 +1,6 @@
 package br.com.povo.cpi.dados;
 
 import java.io.BufferedWriter;
-import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
@@ -15,18 +14,26 @@ import java.net.http.HttpResponse.BodyHandlers;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Objects;
 import java.util.Scanner;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import org.apache.pdfbox.pdmodel.PDDocument;
-import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.lucene.analysis.br.BrazilianAnalyzer;
+import org.apache.lucene.document.Field.Store;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.index.FilterDirectoryReader;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.FuzzyQuery;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.store.FSDirectory;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 
 public class DadosCpi {
+    private static final BrazilianAnalyzer ANALYZER = new BrazilianAnalyzer();
     private static final Path biblioteca = Paths.get(System.getProperty("user.home"), ".cpi-senado");
     private static final Path luceneIndexPath = Paths.get(System.getProperty("user.home"), ".cpi-senado-index");
 
@@ -48,42 +55,35 @@ public class DadosCpi {
 
         Document doc = Jsoup.connect("https://legis.senado.leg.br/comissoes/docsRecCPI?codcol=2441").get();
         System.out.println(doc.title());
-        for (Element element : doc.getElementsByTag("a")) {
+        for (var element : doc.getElementsByTag("a")) {
             if (element.hasAttr("href") && element.attr("href").contains("sdleg-getter")
                     && element.text().startsWith("DOC ")) {
-                URL docUrl = new URL(element.attr("href"));
+                var docUrl = new URL(element.attr("href"));
                 download(element, docUrl);
             }
 
         }
 
-        try (Scanner scanner = new Scanner(System.in)) {
+        indexer(luceneIndexPath);
+
+        var indexSearcher = new IndexSearcher(FilterDirectoryReader.open(FSDirectory.open(luceneIndexPath)));
+        try (var scanner = new Scanner(System.in)) {
             String input = "";
             while (!"sair".equalsIgnoreCase(input)) {
-
-                System.out.println("Insira o termo de busca, ou \"sair\" para finalizar. Para encerrar a busca \"CTRL + C\"");
+                System.out.println(
+                        "Insira o termo de busca, ou \"sair\" para finalizar. Para encerrar a busca \"CTRL + C\"");
                 input = scanner.nextLine();
                 var termo = input;
-                var arquivos = Stream.of(biblioteca.toFile().list()).filter(path -> path.endsWith(".pdf")).map(path -> {
-                    try {
-                        File file = biblioteca.resolve(path).toFile();
-                        PDDocument document = PDDocument.load(file);
-                        PDFTextStripper pdfStripper = new PDFTextStripper();
-                        String text = pdfStripper.getText(document);
-                        if (text.toLowerCase().contains(termo.toLowerCase())) {
-                            return Files.readString(biblioteca.resolve(path.replace(".pdf", ".info")));
-                        }
-                        document.close();
-                        return null;
-                    } catch (IOException e) {
-                        return null;
+                var docs = indexSearcher.search(new FuzzyQuery(new Term("contents", termo)), 50);
+                if (docs.totalHits.value > 0l) {
+                    System.out.println("Termo encontrado em arquivos " + docs.totalHits.value);
+                    for (ScoreDoc score : docs.scoreDocs) {
+                        System.out.printf("%f - %s\n", score.score,
+                                indexSearcher.doc(score.doc).getField("filename").stringValue());
                     }
-                }).filter(Objects::nonNull).collect(Collectors.toList());
-                if (arquivos.isEmpty()) {
-                    System.out.println("Termo não encontrado!");
+
                 } else {
-                    System.out.println(
-                            "Termo encontrado nos arquivos: " + arquivos.stream().collect(Collectors.joining(", ")));
+                    System.out.println("Termo não encontrado!");
                 }
             }
         }
@@ -91,19 +91,47 @@ public class DadosCpi {
 
     }
 
+    public static void indexer(Path indexDirectoryPath) throws IOException {
+        try (var writer = new IndexWriter(FSDirectory.open(indexDirectoryPath),
+                new IndexWriterConfig(ANALYZER).setCommitOnClose(true))) {
+            Stream.of(biblioteca.toFile().list()).filter(file -> file.endsWith(".pdf"))
+                    .filter(file -> !biblioteca.resolve(file.replace(".pdf", ".index")).toFile().exists())
+                    .forEach(file -> {
+                        try (var markerWriter = new BufferedWriter(
+                                new FileWriter(biblioteca.resolve(file.replace(".pdf", ".index")).toFile()))) {
+                            var doc = PDFDocument.create(biblioteca.resolve(file).toFile());
+
+                            doc.add(new StringField("filename",
+                                    Files.readString(biblioteca.resolve(file.replace(".pdf", ".info"))), Store.YES));
+                            writer.addDocument(doc);
+                            markerWriter.append("done");
+                            System.out.println("Arquivo indexado: "
+                                    + Files.readString(biblioteca.resolve(file.replace(".pdf", ".info"))));
+                        } catch (IOException e) {
+                            try {
+                                System.err.println("Não foi possível indexar: "
+                                        + Files.readString(biblioteca.resolve(file.replace(".pdf", ".info"))));
+                            } catch (IOException e1) {
+                                // OK! Vamos ignorar
+                            }
+                        }
+                    });
+        }
+    }
+
     private static void download(Element element, URL docUrl)
             throws MalformedURLException, URISyntaxException, IOException, FileNotFoundException, InterruptedException {
-        String[] paths = docUrl.getPath().split("/");
-        Path docData = biblioteca.resolve(paths[paths.length - 1] + ".pdf");
-        Path docInfo = biblioteca.resolve(paths[paths.length - 1] + ".info");
+        var paths = docUrl.getPath().split("/");
+        var docData = biblioteca.resolve(paths[paths.length - 1] + ".pdf");
+        var docInfo = biblioteca.resolve(paths[paths.length - 1] + ".info");
         if (!docData.toFile().exists()) {
             System.out.println("Executing request: " + docUrl);
 
-            HttpRequest request = HttpRequest.newBuilder().uri(docUrl.toURI()).build();
+            var request = HttpRequest.newBuilder().uri(docUrl.toURI()).build();
             var response = client.send(request, BodyHandlers.ofInputStream());
             if (response.statusCode() == 200) {
-                try (FileOutputStream writer = new FileOutputStream(docData.toFile());
-                        BufferedWriter infoWriter = new BufferedWriter(new FileWriter(docInfo.toFile()))) {
+                try (var writer = new FileOutputStream(docData.toFile());
+                        var infoWriter = new BufferedWriter(new FileWriter(docInfo.toFile()))) {
                     infoWriter.write(element.text());
                     writer.write(response.body().readAllBytes());
                 }
